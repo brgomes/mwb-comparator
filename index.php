@@ -1,5 +1,4 @@
 <?php
-declare(strict_types=1);
 
 /**
  * Compara banco.sql x model.mwb
@@ -17,753 +16,999 @@ declare(strict_types=1);
  *   - nomes de índices
  *   - FOREIGN KEY
  *   - constraints
+ *   - colunas de auditoria:
+ *       created_at
+ *       updated_at
+ *       created_by
+ *       updated_by
  *
  * Uso:
- *   php index.php database.sql model.mwb
+ *   php index.php nome
  *
- * O relatório TXT é gerado automaticamente como relatorio.txt.
- *   php index.php database.sql model.mwb relatorio.txt
+ * Os arquivos nome.sql, nome.mwb e nome.txt
+ * devem estar na mesma pasta.
  */
 
 if (PHP_SAPI !== 'cli') {
     exit("Execute este arquivo pela CLI.\n");
 }
 
-if ($argc < 3 || $argc > 4) {
-    exit("Uso: php index.php database.sql model.mwb [relatorio.txt]\n");
+if ($argc !== 2) {
+    exit("Uso: php index.php nome\n");
 }
 
-$sqlFile = $argv[1];
-$mwbFile = $argv[2];
-$reportFile = $argv[3] ?? 'relatorio.txt';
+$name = trim($argv[1]);
 
-// O relatório é sempre salvo na raiz do projeto, junto ao index.php.
-$reportFile = basename($reportFile);
+if ($name === '' || preg_match('~[\\/:*?"<>|]~', $name)) {
+    exit(
+        "ERRO: informe um nome válido para os arquivos.\n" .
+        "Exemplo: php index.php sobgestao\n"
+    );
+}
+
+$sqlFile = __DIR__ . DIRECTORY_SEPARATOR . $name . '.sql';
+$mwbFile = __DIR__ . DIRECTORY_SEPARATOR . $name . '.mwb';
+
+$reportFile = basename($name . '.txt');
 $reportPath = __DIR__ . DIRECTORY_SEPARATOR . $reportFile;
 
 if (!is_file($sqlFile)) {
-    fail("Arquivo SQL não encontrado: {$sqlFile}");
+    fail("Arquivo SQL não encontrado: {$name}.sql");
 }
+
 if (!is_file($mwbFile)) {
-    fail("Arquivo MWB não encontrado: {$mwbFile}");
+    fail("Arquivo MWB não encontrado: {$name}.mwb");
 }
 
 $db = parseSqlDump($sqlFile);
 $model = parseMwb($mwbFile);
+
 $report = compareSchemas($db, $model);
 
-echo renderTextReport($report);
+$output = renderTextReport($report);
 
-if ($reportFile !== null) {
-    $target = $reportPath;
-    $ok = @file_put_contents($target, renderTextReport($report) . PHP_EOL);
-    if ($ok === false) {
-        fail("não foi possível criar {$target} (permissão de escrita).");
-    }
+echo $output . PHP_EOL;
 
-    echo "\nRelatório TXT salvo na raiz do projeto: {$reportFile}\n";
+$ok = @file_put_contents(
+    $reportPath,
+    $output . PHP_EOL
+);
+
+if ($ok === false) {
+    fail(
+        "não foi possível criar {$reportFile} " .
+        "(permissão de escrita)."
+    );
 }
+
+echo PHP_EOL;
+echo "Relatório TXT salvo na raiz do projeto: {$reportFile}" . PHP_EOL;
 
 // Diferenças são o resultado da comparação, não um erro de execução.
 exit(0);
 
-/* ============================================================
- * SQL
- * ============================================================ */
+
+/*
+|--------------------------------------------------------------------------
+| ERRO
+|--------------------------------------------------------------------------
+*/
+
+function fail(string $message): never
+{
+    echo "ERRO: {$message}" . PHP_EOL;
+    exit(1);
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| SQL
+|--------------------------------------------------------------------------
+*/
 
 function parseSqlDump(string $file): array
 {
     $sql = file_get_contents($file);
-    if ($sql === false) fail("Não foi possível ler o SQL.");
 
-    $sql = preg_replace('/\/\*.*?\*\//s', '', $sql) ?? $sql;
-    $sql = preg_replace('/^\s*--.*$/m', '', $sql) ?? $sql;
-
-    $schema = [];
-
-    $pattern = '/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`[^`]+`\.)?`?([^`\s(]+)`?\s*\((.*?)\)\s*(?:ENGINE\b|;)/is';
-
-    if (!preg_match_all($pattern, $sql, $matches, PREG_SET_ORDER)) {
-        fail("Nenhum CREATE TABLE foi encontrado no SQL.");
+    if ($sql === false) {
+        fail("não foi possível ler o arquivo SQL.");
     }
+
+    $tables = [];
+
+    /*
+     * Captura cada CREATE TABLE.
+     */
+    preg_match_all(
+        '/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?([a-zA-Z0-9_]+)[`"]?\s*\((.*?)\)\s*(?:ENGINE|;)/is',
+        $sql,
+        $matches,
+        PREG_SET_ORDER
+    );
 
     foreach ($matches as $match) {
-        $table = normalizeIdentifier($match[1]);
-        $schema[$table] = parseCreateTableBody($match[2]);
-    }
+        $tableName = $match[1];
+        $body = $match[2];
 
-    return $schema;
-}
+        $columns = [];
+        $primaryKey = [];
 
-function parseCreateTableBody(string $body): array
-{
-    $columns = [];
-    $primary = [];
+        $lines = splitSqlDefinitions($body);
 
-    foreach (splitSqlDefinitions($body) as $definition) {
-        $definition = trim($definition);
-        if ($definition === '') continue;
+        foreach ($lines as $line) {
+            $line = trim($line);
 
-        if (preg_match('/^\s*PRIMARY\s+KEY\s*\((.*?)\)/is', $definition, $m)) {
-            $primary = parseIdentifierList($m[1]);
-            continue;
+            if ($line === '') {
+                continue;
+            }
+
+            /*
+             * PRIMARY KEY
+             */
+            if (preg_match(
+                '/^PRIMARY\s+KEY\s*\((.*?)\)/i',
+                $line,
+                $pkMatch
+            )) {
+                preg_match_all(
+                    '/[`"]?([a-zA-Z0-9_]+)[`"]?/',
+                    $pkMatch[1],
+                    $pkColumns
+                );
+
+                $primaryKey = $pkColumns[1] ?? [];
+
+                continue;
+            }
+
+            /*
+             * Ignora índices secundários.
+             */
+            if (preg_match(
+                '/^(?:UNIQUE\s+)?(?:KEY|INDEX)\s+/i',
+                $line
+            )) {
+                continue;
+            }
+
+            /*
+             * Ignora FOREIGN KEY.
+             */
+            if (preg_match(
+                '/^(?:CONSTRAINT\s+[`"]?[^`"\s]+[`"]?\s+)?FOREIGN\s+KEY/i',
+                $line
+            )) {
+                continue;
+            }
+
+            /*
+             * Ignora constraints.
+             */
+            if (preg_match(
+                '/^(?:CONSTRAINT|CHECK)\s+/i',
+                $line
+            )) {
+                continue;
+            }
+
+            /*
+             * Coluna.
+             */
+            if (!preg_match(
+                '/^[`"]?([a-zA-Z0-9_]+)[`"]?\s+(.+)$/s',
+                $line,
+                $columnMatch
+            )) {
+                continue;
+            }
+
+            $columnName = $columnMatch[1];
+            $definition = trim($columnMatch[2]);
+
+            $column = parseSqlColumnDefinition($definition);
+
+            $columns[$columnName] = $column;
         }
 
-        if (preg_match('/^\s*(?:CONSTRAINT|FOREIGN\s+KEY|KEY|INDEX|UNIQUE|FULLTEXT|SPATIAL|CHECK)\b/i', $definition)) {
-            continue;
-        }
-
-        if (!preg_match('/^\s*`([^`]+)`\s+(.+)$/is', $definition, $m)) {
-            continue;
-        }
-
-        $name = normalizeIdentifier($m[1]);
-        $rest = trim($m[2]);
-
-        $columns[$name] = [
-            'name' => $name,
-            'type' => normalizeSqlType(extractSqlType($rest)),
-            'nullable' => !preg_match('/\bNOT\s+NULL\b/i', $rest),
-            'default' => normalizeDefault(extractSqlDefault($rest)),
+        $tables[$tableName] = [
+            'name' => $tableName,
+            'columns' => $columns,
+            'primaryKey' => $primaryKey,
         ];
     }
 
-    // PRIMARY KEY inline: `id` BIGINT ... PRIMARY KEY
-    foreach (splitSqlDefinitions($body) as $definition) {
-        if (preg_match('/^\s*`([^`]+)`\s+(.+)$/is', trim($definition), $m) &&
-            preg_match('/\bPRIMARY\s+KEY\b/i', $m[2])) {
-            $primary[] = normalizeIdentifier($m[1]);
+    return $tables;
+}
+
+
+/**
+ * Divide as definições do CREATE TABLE respeitando parênteses
+ * e strings.
+ */
+function splitSqlDefinitions(string $body): array
+{
+    $definitions = [];
+    $current = '';
+
+    $depth = 0;
+    $quote = null;
+    $length = strlen($body);
+
+    for ($i = 0; $i < $length; $i++) {
+        $char = $body[$i];
+
+        if ($quote !== null) {
+            $current .= $char;
+
+            if ($char === '\\' && $i + 1 < $length) {
+                $current .= $body[++$i];
+                continue;
+            }
+
+            if ($char === $quote) {
+                $quote = null;
+            }
+
+            continue;
         }
+
+        if ($char === "'" || $char === '"') {
+            $quote = $char;
+            $current .= $char;
+            continue;
+        }
+
+        if ($char === '(') {
+            $depth++;
+            $current .= $char;
+            continue;
+        }
+
+        if ($char === ')') {
+            $depth--;
+            $current .= $char;
+            continue;
+        }
+
+        if ($char === ',' && $depth === 0) {
+            $definitions[] = trim($current);
+            $current = '';
+            continue;
+        }
+
+        $current .= $char;
+    }
+
+    if (trim($current) !== '') {
+        $definitions[] = trim($current);
+    }
+
+    return $definitions;
+}
+
+
+/**
+ * Analisa a definição de uma coluna SQL.
+ */
+function parseSqlColumnDefinition(string $definition): array
+{
+    $type = '';
+    $nullable = true;
+    $default = null;
+
+    /*
+     * Tipo:
+     * VARCHAR(191)
+     * DECIMAL(12,2)
+     * ENUM('A','B')
+     * etc.
+     */
+    if (preg_match(
+        '/^([a-zA-Z]+)(\s*\([^)]*\))?(?:\s+UNSIGNED)?/i',
+        $definition,
+        $typeMatch
+    )) {
+        $type = $typeMatch[1];
+
+        if (!empty($typeMatch[2])) {
+            $type .= $typeMatch[2];
+        }
+
+        if (preg_match(
+            '/\bUNSIGNED\b/i',
+            substr($definition, strlen($typeMatch[0]))
+        )) {
+            $type .= ' UNSIGNED';
+        } elseif (preg_match('/\bUNSIGNED\b/i', $definition)) {
+            $type .= ' UNSIGNED';
+        }
+    }
+
+    /*
+     * NOT NULL / NULL
+     */
+    if (preg_match('/\bNOT\s+NULL\b/i', $definition)) {
+        $nullable = false;
+    } elseif (preg_match('/\bNULL\b/i', $definition)) {
+        $nullable = true;
+    }
+
+    /*
+     * DEFAULT.
+     */
+    if (preg_match(
+        '/\bDEFAULT\s+((?:\'(?:\\\\.|[^\'])*\')|(?:"(?:\\\\.|[^"])*")|[^\s,]+)/i',
+        $definition,
+        $defaultMatch
+    )) {
+        $default = $defaultMatch[1];
     }
 
     return [
-        'columns' => $columns,
-        'primary' => array_values(array_unique($primary)),
+        'type' => normalizeSqlType($type),
+        'nullable' => $nullable,
+        'default' => normalizeDefault($default),
     ];
 }
 
-function extractSqlType(string $rest): string
-{
-    if (preg_match('/^([a-zA-Z]+)(?:\s*\(([^)]*)\))?((?:\s+UNSIGNED)?(?:\s+ZEROFILL)?)/i', $rest, $m)) {
-        $base = strtoupper($m[1]);
-        $params = isset($m[2]) ? trim($m[2]) : '';
-        $attrs = strtoupper(trim($m[3] ?? ''));
 
-        return $base . ($params !== '' ? '(' . $params . ')' : '') . $attrs;
-    }
-    return '';
-}
-
-function extractSqlDefault(string $rest): ?string
-{
-    if (!preg_match('/\bDEFAULT\s+/i', $rest, $m, PREG_OFFSET_CAPTURE)) {
-        return null;
-    }
-
-    $start = $m[0][1] + strlen($m[0][0]);
-    $tail = ltrim(substr($rest, $start));
-    if ($tail === '') return null;
-
-    if ($tail[0] === "'" || $tail[0] === '"') {
-        $quote = $tail[0];
-        $value = '';
-        $escaped = false;
-
-        for ($i = 1, $len = strlen($tail); $i < $len; $i++) {
-            $c = $tail[$i];
-            if ($escaped) {
-                $value .= $c;
-                $escaped = false;
-            } elseif ($c === '\\') {
-                $escaped = true;
-                $value .= $c;
-            } elseif ($c === $quote) {
-                return $value;
-            } else {
-                $value .= $c;
-            }
-        }
-        return $value;
-    }
-
-    if (preg_match('/^([^\s,]+)/', $tail, $m)) {
-        return $m[1];
-    }
-
-    return null;
-}
-
-function splitSqlDefinitions(string $body): array
-{
-    $parts = [];
-    $current = '';
-    $depth = 0;
-    $quote = null;
-    $escaped = false;
-
-    for ($i = 0, $len = strlen($body); $i < $len; $i++) {
-        $c = $body[$i];
-
-        if ($quote !== null) {
-            $current .= $c;
-            if ($escaped) {
-                $escaped = false;
-            } elseif ($c === '\\') {
-                $escaped = true;
-            } elseif ($c === $quote) {
-                $quote = null;
-            }
-            continue;
-        }
-
-        if ($c === "'" || $c === '"') {
-            $quote = $c;
-            $current .= $c;
-        } elseif ($c === '(') {
-            $depth++;
-            $current .= $c;
-        } elseif ($c === ')') {
-            $depth--;
-            $current .= $c;
-        } elseif ($c === ',' && $depth === 0) {
-            $parts[] = trim($current);
-            $current = '';
-        } else {
-            $current .= $c;
-        }
-    }
-
-    if (trim($current) !== '') $parts[] = trim($current);
-    return $parts;
-}
-
-/* ============================================================
- * MWB
- * ============================================================ */
+/*
+|--------------------------------------------------------------------------
+| MWB
+|--------------------------------------------------------------------------
+*/
 
 function parseMwb(string $file): array
 {
-    if (!class_exists('ZipArchive')) {
-        fail("A extensão ZipArchive não está habilitada.");
-    }
-
     $zip = new ZipArchive();
+
     if ($zip->open($file) !== true) {
-        fail("Não foi possível abrir o MWB.");
+        fail("não foi possível abrir o arquivo MWB.");
     }
 
     $xml = $zip->getFromName('document.mwb.xml');
+
     $zip->close();
 
     if ($xml === false) {
-        fail("document.mwb.xml não foi encontrado dentro do MWB.");
+        fail("document.mwb.xml não encontrado dentro do arquivo MWB.");
     }
 
-    $dom = new DOMDocument();
-    $dom->preserveWhiteSpace = false;
+    libxml_use_internal_errors(true);
 
-    if (!@$dom->loadXML($xml, LIBXML_NONET | LIBXML_NOBLANKS)) {
-        fail("O XML interno do MWB não pôde ser interpretado.");
+    $dom = new DOMDocument();
+
+    if (!$dom->loadXML($xml)) {
+        fail("não foi possível interpretar document.mwb.xml.");
     }
 
     $xpath = new DOMXPath($dom);
-    $schema = [];
 
-    // O seu MWB possui exatamente objetos db.mysql.Table.
-    $tables = $xpath->query('//*[@struct-name="db.mysql.Table"]');
-    if ($tables === false) fail("Não foi possível localizar as tabelas no MWB.");
+    $objects = [];
 
-    foreach ($tables as $tableNode) {
-        if (!$tableNode instanceof DOMElement) continue;
+    /*
+     * Primeiro indexamos todos os objetos pelo id.
+     */
+    foreach ($xpath->query('//*[@id]') as $node) {
+        $id = $node->getAttribute('id');
 
-        $tableName = directValue($tableNode, 'name');
+        if ($id !== '') {
+            $objects[$id] = $node;
+        }
+    }
+
+    $tables = [];
+
+    /*
+     * As tabelas do Workbench são db.mysql.Table.
+     */
+    foreach (
+        $xpath->query('//*[@struct-name="db.mysql.Table"]')
+        as $tableNode
+    ) {
+        $tableName = getDirectValue($xpath, $tableNode, 'name');
+
         if ($tableName === null || trim($tableName) === '') {
-            // O MWB contém objetos Table vazios; eles não representam tabelas.
             continue;
         }
 
-        $tableName = normalizeIdentifier($tableName);
+        $tableName = trim($tableName);
+
         $columns = [];
 
-        $columnList = directValueNode($tableNode, 'columns');
-        if ($columnList !== null) {
-            foreach ($columnList->childNodes as $columnNode) {
-                if (!$columnNode instanceof DOMElement ||
-                    $columnNode->getAttribute('struct-name') !== 'db.mysql.Column') {
+        /*
+         * columns é um value que contém objetos
+         * db.mysql.Column.
+         */
+        $columnsContainer = getDirectValueNode(
+            $xpath,
+            $tableNode,
+            'columns'
+        );
+
+        if ($columnsContainer !== null) {
+            foreach (
+                $xpath->query(
+                    './value[@type="object" and @struct-name="db.mysql.Column"]',
+                    $columnsContainer
+                ) as $columnNode
+            ) {
+                $columnName = getDirectValue(
+                    $xpath,
+                    $columnNode,
+                    'name'
+                );
+
+                if ($columnName === null || trim($columnName) === '') {
                     continue;
                 }
 
-                $name = directValue($columnNode, 'name');
-                if ($name === null || trim($name) === '') continue;
+                $columnName = trim($columnName);
 
-                $name = normalizeIdentifier($name);
-
-                $type = buildMwbType($columnNode);
-                $isNotNull = directValue($columnNode, 'isNotNull');
-                $default = directValue($columnNode, 'defaultValue');
-
-                $defaultIsNull = directValue($columnNode, 'defaultValueIsNull');
-                if ($defaultIsNull === '1') {
-                    $default = 'NULL';
-                }
-
-                $columns[$name] = [
-                    'name' => $name,
-                    'type' => $type,
-                    'nullable' => !in_array((string)$isNotNull, ['1', 'true'], true),
-                    'default' => normalizeDefault($default),
-                ];
+                $columns[$columnName] = parseMwbColumn(
+                    $xpath,
+                    $columnNode
+                );
             }
         }
 
-        $primary = [];
-        $indexList = directValueNode($tableNode, 'indices');
+        /*
+         * PRIMARY KEY.
+         */
+        $primaryKey = [];
 
-        if ($indexList !== null) {
-            foreach ($indexList->childNodes as $indexNode) {
-                if (!$indexNode instanceof DOMElement ||
-                    $indexNode->getAttribute('struct-name') !== 'db.mysql.Index') {
-                    continue;
-                }
+        $indicesContainer = getDirectValueNode(
+            $xpath,
+            $tableNode,
+            'indices'
+        );
 
-                $isPrimary = directValue($indexNode, 'isPrimary');
-                $indexType = strtoupper((string)directValue($indexNode, 'indexType'));
+        if ($indicesContainer !== null) {
+            foreach (
+                $xpath->query(
+                    './value[@type="object" and @struct-name="db.mysql.Index"]',
+                    $indicesContainer
+                ) as $indexNode
+            ) {
+                $isPrimary = getDirectValue(
+                    $xpath,
+                    $indexNode,
+                    'isPrimary'
+                );
 
-                if ($isPrimary !== '1' && $indexType !== 'PRIMARY') continue;
+                $indexType = getDirectValue(
+                    $xpath,
+                    $indexNode,
+                    'indexType'
+                );
 
-                $indexColumns = directValueNode($indexNode, 'columns');
-                if ($indexColumns === null) continue;
+                if (
+                    (string) $isPrimary === '1' ||
+                    strtoupper((string) $indexType) === 'PRIMARY'
+                ) {
+                    $indexColumnsContainer = getDirectValueNode(
+                        $xpath,
+                        $indexNode,
+                        'columns'
+                    );
 
-                foreach ($indexColumns->childNodes as $indexColumnNode) {
-                    if (!$indexColumnNode instanceof DOMElement) continue;
+                    if ($indexColumnsContainer !== null) {
+                        foreach (
+                            $xpath->query(
+                                './value[@type="object" and @struct-name="db.mysql.IndexColumn"]',
+                                $indexColumnsContainer
+                            ) as $indexColumnNode
+                        ) {
+                            $refId = null;
 
-                    $referenced = directLink($indexColumnNode, 'referencedColumn');
-                    if ($referenced !== null) {
-                        // Resolve pelo ID depois.
-                        $primary[] = ['id' => $referenced];
+                            foreach (
+                                $xpath->query(
+                                    './link[@key="referencedColumn"]',
+                                    $indexColumnNode
+                                ) as $link
+                            ) {
+                                $refId = trim($link->textContent);
+                                break;
+                            }
+
+                            if ($refId !== null && isset($objects[$refId])) {
+                                $pkColumnName = getDirectValue(
+                                    $xpath,
+                                    $objects[$refId],
+                                    'name'
+                                );
+
+                                if (
+                                    $pkColumnName !== null &&
+                                    $pkColumnName !== ''
+                                ) {
+                                    $primaryKey[] = $pkColumnName;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Resolve os IDs das colunas da PK.
-        $idToName = [];
-        if ($columnList !== null) {
-            foreach ($columnList->childNodes as $columnNode) {
-                if ($columnNode instanceof DOMElement) {
-                    $n = directValue($columnNode, 'name');
-                    if ($n !== null && $columnNode->hasAttribute('id')) {
-                        $idToName[$columnNode->getAttribute('id')] = normalizeIdentifier($n);
-                    }
-                }
-            }
-        }
-
-        $resolvedPrimary = [];
-        foreach ($primary as $pk) {
-            if (isset($idToName[$pk['id']])) {
-                $resolvedPrimary[] = $idToName[$pk['id']];
-            }
-        }
-
-        $schema[$tableName] = [
+        $tables[$tableName] = [
+            'name' => $tableName,
             'columns' => $columns,
-            'primary' => array_values(array_unique($resolvedPrimary)),
+            'primaryKey' => $primaryKey,
         ];
     }
 
-    if (!$schema) fail("Nenhuma tabela foi extraída do MWB.");
-
-    return $schema;
+    return $tables;
 }
 
-function directValueNode(DOMElement $node, string $key): ?DOMElement
-{
-    foreach ($node->childNodes as $child) {
-        if ($child instanceof DOMElement &&
-            $child->tagName === 'value' &&
-            $child->getAttribute('key') === $key) {
-            return $child;
-        }
+
+/**
+ * Analisa uma coluna do MWB.
+ */
+function parseMwbColumn(
+    DOMXPath $xpath,
+    DOMElement $columnNode
+): array {
+    $simpleType = null;
+    $userType = null;
+
+    foreach (
+        $xpath->query('./link[@key="simpleType"]', $columnNode)
+        as $link
+    ) {
+        $simpleType = trim($link->textContent);
+        break;
     }
-    return null;
-}
 
-function directValue(DOMElement $node, string $key): ?string
-{
-    $v = directValueNode($node, $key);
-    if ($v === null) return null;
-    return trim($v->textContent);
-}
-
-function directLink(DOMElement $node, string $key): ?string
-{
-    foreach ($node->childNodes as $child) {
-        if ($child instanceof DOMElement &&
-            $child->tagName === 'link' &&
-            $child->getAttribute('key') === $key) {
-            return trim($child->textContent);
-        }
+    foreach (
+        $xpath->query('./link[@key="userType"]', $columnNode)
+        as $link
+    ) {
+        $userType = trim($link->textContent);
+        break;
     }
-    return null;
-}
 
-function buildMwbType(DOMElement $column): string
-{
+    $explicitParams = getDirectValue(
+        $xpath,
+        $columnNode,
+        'datatypeExplicitParams'
+    );
+
+    $length = getDirectValue(
+        $xpath,
+        $columnNode,
+        'length'
+    );
+
+    $precision = getDirectValue(
+        $xpath,
+        $columnNode,
+        'precision'
+    );
+
+    $scale = getDirectValue(
+        $xpath,
+        $columnNode,
+        'scale'
+    );
+
+    $default = getDirectValue(
+        $xpath,
+        $columnNode,
+        'defaultValue'
+    );
+
+    $defaultValueIsNull = getDirectValue(
+        $xpath,
+        $columnNode,
+        'defaultValueIsNull'
+    );
+
+    $isNotNull = getDirectValue(
+        $xpath,
+        $columnNode,
+        'isNotNull'
+    );
+
+    $flags = getDirectValueList(
+        $xpath,
+        $columnNode,
+        'flags'
+    );
+
+    $type = buildMwbType(
+        $simpleType,
+        $userType,
+        $explicitParams,
+        $length,
+        $precision,
+        $scale,
+        $flags
+    );
+
     /*
-     * No MWB o simpleType é armazenado como, por exemplo:
-     *   com.mysql.rdbms.mysql.datatype.bigint
-     *   com.mysql.rdbms.mysql.datatype.varchar
-     *   com.mysql.rdbms.mysql.datatype.timestamp_f
-     *
-     * Não podemos usar basename(), pois o separador é ponto, não barra.
+     * defaultValueIsNull indica que não há default definido.
      */
-    $link = directLink($column, 'simpleType');
-    $userType = directLink($column, 'userType');
-    $base = '';
-    $forceBooleanWidth = false;
-
-    // O Workbench usa User Type para campos booleanos.
-    if ($userType !== null) {
-        $userTypeBase = strtolower(trim((string)$userType));
-
-        if (str_ends_with($userTypeBase, '.boolean')) {
-            $base = 'tinyint';
-            $forceBooleanWidth = true;
-        } elseif (str_ends_with($userTypeBase, '.integer')) {
-            // Alguns campos do Workbench usam UserDatatype em vez de
-            // SimpleDatatype. O UserDatatype "integer" corresponde a INT.
-            $base = 'int';
-        }
+    if ((string) $defaultValueIsNull === '1') {
+        $default = null;
     }
 
-    if ($base === '' && $link !== null && $link !== '') {
-        $parts = explode('.', strtolower(trim($link)));
-        $base = end($parts) ?: '';
+    return [
+        'type' => normalizeSqlType($type),
+        'nullable' => ((string) $isNotNull !== '1'),
+        'default' => normalizeDefault($default),
+    ];
+}
+
+
+/**
+ * Constrói o tipo SQL a partir das informações do Workbench.
+ */
+function buildMwbType(
+    ?string $simpleType,
+    ?string $userType,
+    ?string $explicitParams,
+    ?string $length,
+    ?string $precision,
+    ?string $scale,
+    array $flags
+): string {
+    /*
+     * Tipos definidos pelo usuário.
+     */
+    if (
+        $userType !== null &&
+        str_ends_with(
+            $userType,
+            'com.mysql.rdbms.mysql.userdatatype.boolean'
+        )
+    ) {
+        return 'TINYINT(1)';
     }
 
-    $baseMap = [
-        'bigint' => 'BIGINT',
-        'int' => 'INT',
-        'integer' => 'INT',
-        'mediumint' => 'MEDIUMINT',
-        'smallint' => 'SMALLINT',
-        'tinyint' => 'TINYINT',
-        'decimal' => 'DECIMAL',
-        'numeric' => 'DECIMAL',
-        'float' => 'FLOAT',
-        'double' => 'DOUBLE',
-        'double_precision' => 'DOUBLE',
-        'real' => 'REAL',
-        'varchar' => 'VARCHAR',
-        'char' => 'CHAR',
-        'binary' => 'BINARY',
-        'varbinary' => 'VARBINARY',
-        'text' => 'TEXT',
-        'tinytext' => 'TINYTEXT',
-        'mediumtext' => 'MEDIUMTEXT',
-        'longtext' => 'LONGTEXT',
-        'blob' => 'BLOB',
-        'tinyblob' => 'TINYBLOB',
-        'mediumblob' => 'MEDIUMBLOB',
-        'longblob' => 'LONGBLOB',
-        'date' => 'DATE',
-        'datetime' => 'DATETIME',
-        'datetime_f' => 'DATETIME',
-        'timestamp' => 'TIMESTAMP',
-        'timestamp_f' => 'TIMESTAMP',
-        'time' => 'TIME',
-        'year' => 'YEAR',
-        'enum' => 'ENUM',
-        'set' => 'SET',
-        'json' => 'JSON',
-        'boolean' => 'TINYINT',
-        'bool' => 'TINYINT',
-        'integer' => 'INT',
+    if (
+        $userType !== null &&
+        str_ends_with(
+            $userType,
+            'com.mysql.rdbms.mysql.userdatatype.integer'
+        )
+    ) {
+        return 'INT';
+    }
+
+    /*
+     * Tipo simples.
+     */
+    $type = '';
+
+    if ($simpleType !== null && $simpleType !== '') {
+        $parts = explode('.', $simpleType);
+        $type = strtoupper(end($parts));
+    }
+
+    $map = [
+        'BIGINT' => 'BIGINT',
+        'INT' => 'INT',
+        'INTEGER' => 'INT',
+        'SMALLINT' => 'SMALLINT',
+        'MEDIUMINT' => 'MEDIUMINT',
+        'TINYINT' => 'TINYINT',
+        'DECIMAL' => 'DECIMAL',
+        'NUMERIC' => 'DECIMAL',
+        'FLOAT' => 'FLOAT',
+        'DOUBLE' => 'DOUBLE',
+        'DOUBLE_PRECISION' => 'DOUBLE',
+        'VARCHAR' => 'VARCHAR',
+        'CHAR' => 'CHAR',
+        'TEXT' => 'TEXT',
+        'TINYTEXT' => 'TINYTEXT',
+        'MEDIUMTEXT' => 'MEDIUMTEXT',
+        'LONGTEXT' => 'LONGTEXT',
+        'BINARY' => 'BINARY',
+        'VARBINARY' => 'VARBINARY',
+        'BLOB' => 'BLOB',
+        'TINYBLOB' => 'TINYBLOB',
+        'MEDIUMBLOB' => 'MEDIUMBLOB',
+        'LONGBLOB' => 'LONGBLOB',
+        'DATE' => 'DATE',
+        'TIME' => 'TIME',
+        'DATETIME' => 'DATETIME',
+        'DATETIME_F' => 'DATETIME',
+        'TIMESTAMP' => 'TIMESTAMP',
+        'TIMESTAMP_F' => 'TIMESTAMP',
+        'YEAR' => 'YEAR',
+        'JSON' => 'JSON',
+        'ENUM' => 'ENUM',
+        'SET' => 'SET',
     ];
 
-    $type = $baseMap[$base] ?? strtoupper($base);
-
-    $explicit = directValue($column, 'datatypeExplicitParams');
-    $length = directValue($column, 'length');
-    $precision = directValue($column, 'precision');
-    $scale = directValue($column, 'scale');
-
-    $params = '';
-
-    if ($forceBooleanWidth) {
-        $params = '1';
-    } elseif ($explicit !== null && trim($explicit) !== '') {
-        $params = normalizeMwbExplicitParams($explicit, $type);
-    } elseif (in_array($type, ['VARCHAR', 'CHAR', 'VARBINARY', 'BINARY'], true) &&
-              $length !== null && (int)$length >= 0) {
-        $params = (string)(int)$length;
-    } elseif ($type === 'DECIMAL' &&
-              $precision !== null && (int)$precision >= 0) {
-        $params = (string)(int)$precision;
-        if ($scale !== null && (int)$scale >= 0) {
-            $params .= ',' . (string)(int)$scale;
-        }
-    } elseif (in_array($type, ['BIGINT', 'INT', 'MEDIUMINT', 'SMALLINT', 'TINYINT'], true) &&
-              $precision !== null && (int)$precision >= 0) {
-        // O Workbench preserva o display width do modelo/dump.
-        $params = (string)(int)$precision;
+    if (isset($map[$type])) {
+        $type = $map[$type];
     }
 
-    if ($params !== '' && !in_array($type, [
-        'TEXT', 'TINYTEXT', 'MEDIUMTEXT', 'LONGTEXT',
-        'BLOB', 'TINYBLOB', 'MEDIUMBLOB', 'LONGBLOB',
-        'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR', 'JSON',
-        'FLOAT', 'DOUBLE', 'REAL'
-    ], true)) {
+    /*
+     * ENUM / SET.
+     */
+    if (
+        in_array($type, ['ENUM', 'SET'], true) &&
+        $explicitParams !== null &&
+        trim($explicitParams) !== ''
+    ) {
+        $params = normalizeMwbExplicitParams(
+            $explicitParams,
+            $type
+        );
+
         $type .= '(' . $params . ')';
     }
 
-    $flags = directValueNode($column, 'flags');
-    $unsigned = false;
-
-    if ($flags !== null) {
-        foreach ($flags->childNodes as $flag) {
-            if ($flag instanceof DOMElement &&
-                strtoupper(trim($flag->textContent)) === 'UNSIGNED') {
-                $unsigned = true;
-                break;
-            }
+    /*
+     * VARCHAR / CHAR / BINARY / VARBINARY.
+     */
+    elseif (
+        in_array(
+            $type,
+            ['VARCHAR', 'CHAR', 'BINARY', 'VARBINARY'],
+            true
+        )
+    ) {
+        if ($length !== null && trim($length) !== '') {
+            $type .= '(' . trim($length) . ')';
         }
     }
 
-    if ($unsigned && !preg_match('/\bUNSIGNED\b/i', $type)) {
-        $type .= ' UNSIGNED';
+    /*
+     * DECIMAL.
+     */
+    elseif (
+        in_array($type, ['DECIMAL', 'NUMERIC'], true)
+    ) {
+        if (
+            $precision !== null &&
+            trim($precision) !== ''
+        ) {
+            $type .= '(' . trim($precision);
+
+            if (
+                $scale !== null &&
+                trim($scale) !== ''
+            ) {
+                $type .= ',' . trim($scale);
+            }
+
+            $type .= ')';
+        }
     }
 
-    return normalizeSqlType($type);
+    /*
+     * UNSIGNED.
+     */
+    foreach ($flags as $flag) {
+        if (strtoupper(trim($flag)) === 'UNSIGNED') {
+            $type .= ' UNSIGNED';
+            break;
+        }
+    }
+
+    return $type;
 }
 
-function normalizeMwbExplicitParams(string $params, string $type): string
-{
+
+/**
+ * Normaliza parâmetros explícitos do MWB.
+ */
+function normalizeMwbExplicitParams(
+    string $params,
+    string $type
+): string {
     $params = trim($params);
 
-    // ENUM/SET no MWB costuma vir como "('F', 'J')".
+    /*
+     * ENUM/SET normalmente chegam como:
+     *
+     * ('F', 'J')
+     */
     if (in_array($type, ['ENUM', 'SET'], true)) {
-        $params = trim($params, " \t\r\n()\"");
-        $params = preg_replace('/\s*,\s*/', ',', $params) ?? $params;
+        $params = trim(
+            $params,
+            " \t\r\n()\""
+        );
+
+        $params = preg_replace(
+            '/\s*,\s*/',
+            ',',
+            $params
+        ) ?? $params;
+
         return $params;
     }
 
-    return preg_replace('/\s*,\s*/', ',', $params) ?? $params;
+    return preg_replace(
+        '/\s*,\s*/',
+        ',',
+        $params
+    ) ?? $params;
 }
 
-/* ============================================================
- * COMPARAÇÃO
- * ============================================================ */
 
-function isIgnoredColumn(string $column): bool
-{
-    return in_array(
-        strtolower(trim($column)),
-        ['created_at', 'updated_at', 'created_by', 'updated_by'],
-        true
-    );
-}
+/*
+|--------------------------------------------------------------------------
+| NORMALIZAÇÃO
+|--------------------------------------------------------------------------
+*/
 
-function compareSchemas(array $database, array $model): array
-{
-    $tables = array_values(array_unique(array_merge(array_keys($database), array_keys($model))));
-    sort($tables, SORT_NATURAL | SORT_FLAG_CASE);
-
-    $r = [
-        'tables_only_database' => [],
-        'tables_only_model' => [],
-        'tables_equal' => [],
-        'tables' => [],
-        'differences' => 0,
-    ];
-
-    foreach ($tables as $table) {
-        $inDb = isset($database[$table]);
-        $inModel = isset($model[$table]);
-
-        if (!$inDb) {
-            $r['tables_only_model'][] = $table;
-            $r['differences']++;
-        } elseif (!$inModel) {
-            $r['tables_only_database'][] = $table;
-            $r['differences']++;
-        } else {
-            $diff = compareTable($database[$table], $model[$table]);
-
-            if ($diff['different']) {
-                $r['tables'][$table] = $diff;
-                $r['differences'] += $diff['difference_count'];
-            } else {
-                $r['tables_equal'][] = $table;
-            }
-        }
-    }
-
-    return $r;
-}
-
-function compareTable(array $db, array $model): array
-{
-    $r = [
-        'different' => false,
-        'difference_count' => 0,
-        'columns_only_database' => [],
-        'columns_only_model' => [],
-        'columns' => [],
-        'primary_database' => $db['primary'],
-        'primary_model' => $model['primary'],
-        'primary_different' => false,
-    ];
-
-    $columns = array_values(array_unique(array_merge(
-        array_keys($db['columns']),
-        array_keys($model['columns'])
-    )));
-
-    // Estes campos existem propositalmente apenas no banco de dados
-    // e não fazem parte da modelagem do Workbench.
-    $columns = array_values(array_filter(
-        $columns,
-        fn (string $column): bool => !isIgnoredColumn($column)
-    ));
-
-    sort($columns, SORT_NATURAL | SORT_FLAG_CASE);
-
-    foreach ($columns as $column) {
-        $inDb = isset($db['columns'][$column]);
-        $inModel = isset($model['columns'][$column]);
-
-        if (!$inDb) {
-            $r['columns_only_model'][] = $column;
-            $r['difference_count']++;
-            continue;
-        }
-
-        if (!$inModel) {
-            $r['columns_only_database'][] = $column;
-            $r['difference_count']++;
-            continue;
-        }
-
-        $changes = [];
-
-        foreach (['type', 'nullable', 'default'] as $property) {
-            $a = $db['columns'][$column][$property];
-            $b = $model['columns'][$column][$property];
-
-            $equal = match ($property) {
-                'type' => normalizeSqlType((string)$a) === normalizeSqlType((string)$b),
-                'nullable' => $a === $b,
-                'default' => defaultsEqualForColumn($a, $b, (bool)$db['columns'][$column]['nullable'], (bool)$model['columns'][$column]['nullable']),
-            };
-
-            if (!$equal) {
-                $changes[$property] = [
-                    'database' => formatComparable($a),
-                    'model' => formatComparable($b),
-                ];
-            }
-        }
-
-        if ($changes) {
-            $r['columns'][$column] = $changes;
-            $r['difference_count'] += count($changes);
-        }
-    }
-
-    $dbPk = array_map('normalizeIdentifier', $db['primary']);
-    $modelPk = array_map('normalizeIdentifier', $model['primary']);
-
-    if ($dbPk !== $modelPk) {
-        $r['primary_different'] = true;
-        $r['difference_count']++;
-    }
-
-    $r['different'] = $r['difference_count'] > 0;
-    return $r;
-}
-
-/* ============================================================
- * NORMALIZAÇÃO
- * ============================================================ */
-
-function normalizeIdentifier(string $v): string
-{
-    return strtolower(trim($v, " `\t\n\r\0\x0B"));
-}
-
+/**
+ * Normaliza tipos SQL para permitir comparação sem diferenças
+ * irrelevantes de sintaxe.
+ */
 function normalizeSqlType(string $type): string
 {
     $type = strtoupper(trim($type));
-    $type = preg_replace('/\s+/', ' ', $type) ?? $type;
-    $type = preg_replace('/\s*\(\s*/', '(', $type) ?? $type;
-    $type = preg_replace('/\s*\)\s*/', ')', $type) ?? $type;
-    $type = preg_replace('/\s*,\s*/', ',', $type) ?? $type;
 
-    $type = preg_replace('/\bINTEGER\b/', 'INT', $type) ?? $type;
-    $type = preg_replace('/\bNUMERIC\b/', 'DECIMAL', $type) ?? $type;
-    $type = preg_replace('/\bDOUBLE\s+PRECISION\b/', 'DOUBLE', $type) ?? $type;
+    $type = preg_replace(
+        '/\s+/',
+        ' ',
+        $type
+    ) ?? $type;
 
-    // Display width (INT(11), BIGINT(20), TINYINT(1), etc.) não é
-    // considerado uma diferença de tipo nesta comparação.
-    if (preg_match('/^(TINYINT|SMALLINT|MEDIUMINT|INT|BIGINT)(?:\([^)]*\))?(\s+UNSIGNED)?$/', $type, $m)) {
+    $type = preg_replace(
+        '/\s*\(\s*/',
+        '(',
+        $type
+    ) ?? $type;
+
+    $type = preg_replace(
+        '/\s*\)/',
+        ')',
+        $type
+    ) ?? $type;
+
+    $type = preg_replace(
+        '/\s*,\s*/',
+        ',',
+        $type
+    ) ?? $type;
+
+    $type = preg_replace(
+        '/\bINTEGER\b/',
+        'INT',
+        $type
+    ) ?? $type;
+
+    $type = preg_replace(
+        '/\bNUMERIC\b/',
+        'DECIMAL',
+        $type
+    ) ?? $type;
+
+    $type = preg_replace(
+        '/\bDOUBLE\s+PRECISION\b/',
+        'DOUBLE',
+        $type
+    ) ?? $type;
+
+    /*
+     * O MySQL/MariaDB aceita display width em inteiros,
+     * como INT(11) e BIGINT(20). Isso não representa
+     * diferença real de capacidade do tipo.
+     */
+    if (preg_match(
+        '/^(TINYINT|SMALLINT|MEDIUMINT|INT|BIGINT)(?:\([^)]*\))?(\s+UNSIGNED)?$/',
+        $type,
+        $m
+    )) {
         $type = $m[1] . ($m[2] ?? '');
     }
 
-    // Workbench e SQL podem representar os parâmetros de ENUM/SET com
-    // espaços diferentes; para a comparação, a lista de valores é o que importa.
-    if (preg_match('/^(ENUM|SET)\((.*)\)$/i', $type, $m)) {
-        $values = preg_replace('/\s*,\s*/', ',', trim($m[2])) ?? trim($m[2]);
+    /*
+     * ENUM / SET.
+     */
+    if (preg_match(
+        '/^(ENUM|SET)\((.*)\)$/i',
+        $type,
+        $m
+    )) {
+        $values = preg_replace(
+            '/\s*,\s*/',
+            ',',
+            trim($m[2])
+        ) ?? trim($m[2]);
+
         $type = strtoupper($m[1]) . '(' . $values . ')';
     }
 
     return $type;
 }
 
+
+/**
+ * Normaliza DEFAULT.
+ */
 function normalizeDefault(?string $v): ?string
 {
-    if ($v === null) return null;
+    if ($v === null) {
+        return null;
+    }
 
     $v = trim($v);
-    if ($v === '') return null;
 
-    // O parser SQL remove as aspas externas de strings; o Workbench pode
-    // preservá-las. Para a comparação, normalizamos os dois formatos.
-    if (strlen($v) >= 2 &&
-        (($v[0] === "'" && $v[strlen($v) - 1] === "'") ||
-         ($v[0] === '"' && $v[strlen($v) - 1] === '"'))) {
+    if ($v === '') {
+        return null;
+    }
+
+    /*
+     * Remove aspas externas.
+     */
+    if (
+        strlen($v) >= 2 &&
+        (
+            (
+                $v[0] === "'" &&
+                $v[strlen($v) - 1] === "'"
+            ) ||
+            (
+                $v[0] === '"' &&
+                $v[strlen($v) - 1] === '"'
+            )
+        )
+    ) {
         $v = substr($v, 1, -1);
     }
 
     $u = strtoupper($v);
 
-    if ($u === 'NULL') return 'NULL';
-    if ($u === 'CURRENT_TIMESTAMP()' || $u === 'CURRENT_TIMESTAMP') return 'CURRENT_TIMESTAMP';
+    if ($u === 'NULL') {
+        return 'NULL';
+    }
 
-    // 0, 0.0 e 0.00 representam o mesmo default numérico.
-    if (preg_match('/^[+-]?(?:\d+\.?\d*|\.\d+)$/', $v)) {
-        $normalized = rtrim(rtrim($v, '0'), '.');
-        if ($normalized === '' || $normalized === '-0' || $normalized === '+0') {
+    if (
+        $u === 'CURRENT_TIMESTAMP()' ||
+        $u === 'CURRENT_TIMESTAMP'
+    ) {
+        return 'CURRENT_TIMESTAMP';
+    }
+
+    /*
+     * Normaliza números:
+     *
+     * 0.00 -> 0
+     * 10.00 -> 10
+     */
+    if (preg_match(
+        '/^[+-]?(?:\d+\.?\d*|\.\d+)$/',
+        $v
+    )) {
+        $normalized = rtrim(
+            rtrim($v, '0'),
+            '.'
+        );
+
+        if (
+            $normalized === '' ||
+            $normalized === '-0' ||
+            $normalized === '+0'
+        ) {
             return '0';
         }
+
         return $normalized;
     }
 
     return $v;
 }
 
-function defaultsEqual(?string $a, ?string $b): bool
-{
-    $a = normalizeDefault($a);
-    $b = normalizeDefault($b);
 
-    return $a === $b || strtoupper((string)$a) === strtoupper((string)$b);
-}
-
-function defaultsEqualForColumn(?string $database, ?string $model, bool $databaseNullable, bool $modelNullable): bool
-{
+/**
+ * Compara DEFAULT considerando que, em coluna nullable,
+ * ausência de DEFAULT e DEFAULT NULL são equivalentes.
+ */
+function defaultsEqualForColumn(
+    ?string $database,
+    ?string $model,
+    bool $databaseNullable,
+    bool $modelNullable
+): bool {
     $a = normalizeDefault($database);
     $b = normalizeDefault($model);
 
@@ -771,118 +1016,559 @@ function defaultsEqualForColumn(?string $database, ?string $model, bool $databas
         return true;
     }
 
-    // Em SQL, uma coluna nullable sem DEFAULT explícito tem NULL como
-    // default efetivo. O Workbench frequentemente deixa defaultValue vazio
-    // nesse caso. Não é uma diferença de esquema.
-    if (($a === null && $b === 'NULL' && $databaseNullable) ||
-        ($b === null && $a === 'NULL' && $modelNullable)) {
+    if (
+        (
+            $a === null &&
+            $b === 'NULL' &&
+            $databaseNullable
+        ) ||
+        (
+            $b === null &&
+            $a === 'NULL' &&
+            $modelNullable
+        )
+    ) {
         return true;
     }
 
     return false;
 }
 
-function formatComparable(mixed $v): string
-{
-    if ($v === null) return '(nenhum)';
-    if (is_bool($v)) return $v ? 'NULL' : 'NOT NULL';
-    return (string)$v;
+
+function defaultsEqual(
+    ?string $a,
+    ?string $b
+): bool {
+    return normalizeDefault($a) === normalizeDefault($b);
 }
 
-function parseIdentifierList(string $v): array
+
+/*
+|--------------------------------------------------------------------------
+| COLUNAS IGNORADAS
+|--------------------------------------------------------------------------
+*/
+
+function isIgnoredColumn(string $column): bool
 {
-    $out = [];
-
-    foreach (explode(',', $v) as $item) {
-        $item = preg_replace('/\s+(?:ASC|DESC)\s*$/i', '', trim($item)) ?? trim($item);
-        $item = trim($item, " `\t\n\r\0\x0B");
-        if ($item !== '') $out[] = normalizeIdentifier($item);
-    }
-
-    return $out;
+    return in_array(
+        strtolower(trim($column)),
+        [
+            'created_at',
+            'updated_at',
+            'created_by',
+            'updated_by',
+        ],
+        true
+    );
 }
 
-/* ============================================================
- * RELATÓRIO
- * ============================================================ */
 
-function renderTextReport(array $r): string
+/*
+|--------------------------------------------------------------------------
+| COMPARAÇÃO
+|--------------------------------------------------------------------------
+*/
+
+function compareSchemas(
+    array $database,
+    array $model
+): array {
+    $differences = [];
+
+    /*
+     * Tabelas.
+     */
+    $allTables = array_unique(
+        array_merge(
+            array_keys($database),
+            array_keys($model)
+        )
+    );
+
+    natcasesort($allTables);
+
+    $tables = [];
+
+    foreach ($allTables as $table) {
+        $dbTable = findCaseInsensitive(
+            $database,
+            $table
+        );
+
+        $modelTable = findCaseInsensitive(
+            $model,
+            $table
+        );
+
+        if ($dbTable === null) {
+            $differences[] = [
+                'type' => 'table_added',
+                'table' => $table,
+            ];
+
+            $tables[$table] = [
+                'status' => 'missing_database',
+            ];
+
+            continue;
+        }
+
+        if ($modelTable === null) {
+            $differences[] = [
+                'type' => 'table_added_model',
+                'table' => $table,
+            ];
+
+            $tables[$table] = [
+                'status' => 'missing_model',
+            ];
+
+            continue;
+        }
+
+        $tableDifferences = compareTable(
+            $dbTable,
+            $modelTable
+        );
+
+        $tables[$table] = [
+            'status' => empty($tableDifferences)
+                ? 'ok'
+                : 'different',
+            'differences' => $tableDifferences,
+        ];
+
+        foreach ($tableDifferences as $difference) {
+            $differences[] = $difference;
+        }
+    }
+
+    return [
+        'tables' => $tables,
+        'differences' => $differences,
+    ];
+}
+
+
+/**
+ * Compara uma tabela.
+ */
+function compareTable(
+    array $database,
+    array $model
+): array {
+    $differences = [];
+
+    $databaseColumns = $database['columns'];
+    $modelColumns = $model['columns'];
+
+    /*
+     * Remove colunas de auditoria da comparação.
+     */
+    $databaseColumns = array_filter(
+        $databaseColumns,
+        fn ($column, $name) =>
+            !isIgnoredColumn($name),
+        ARRAY_FILTER_USE_BOTH
+    );
+
+    $modelColumns = array_filter(
+        $modelColumns,
+        fn ($column, $name) =>
+            !isIgnoredColumn($name),
+        ARRAY_FILTER_USE_BOTH
+    );
+
+    $allColumns = array_unique(
+        array_merge(
+            array_keys($databaseColumns),
+            array_keys($modelColumns)
+        )
+    );
+
+    natcasesort($allColumns);
+
+    foreach ($allColumns as $columnName) {
+        $dbColumn = findCaseInsensitive(
+            $databaseColumns,
+            $columnName
+        );
+
+        $modelColumn = findCaseInsensitive(
+            $modelColumns,
+            $columnName
+        );
+
+        /*
+         * Existe apenas no modelo.
+         */
+        if ($dbColumn === null) {
+            $differences[] = [
+                'type' => 'column_model_only',
+                'table' => $database['name'],
+                'column' => $columnName,
+            ];
+
+            continue;
+        }
+
+        /*
+         * Existe apenas no banco.
+         */
+        if ($modelColumn === null) {
+            $differences[] = [
+                'type' => 'column_database_only',
+                'table' => $database['name'],
+                'column' => $columnName,
+            ];
+
+            continue;
+        }
+
+        /*
+         * Tipo.
+         */
+        if (
+            normalizeSqlType($dbColumn['type']) !==
+            normalizeSqlType($modelColumn['type'])
+        ) {
+            $differences[] = [
+                'type' => 'column_type',
+                'table' => $database['name'],
+                'column' => $columnName,
+                'model' => normalizeSqlType(
+                    $modelColumn['type']
+                ),
+                'database' => normalizeSqlType(
+                    $dbColumn['type']
+                ),
+            ];
+        }
+
+        /*
+         * Nulabilidade.
+         */
+        if (
+            (bool) $dbColumn['nullable'] !==
+            (bool) $modelColumn['nullable']
+        ) {
+            $differences[] = [
+                'type' => 'column_nullable',
+                'table' => $database['name'],
+                'column' => $columnName,
+                'model' => $modelColumn['nullable']
+                    ? 'NULL'
+                    : 'NOT NULL',
+                'database' => $dbColumn['nullable']
+                    ? 'NULL'
+                    : 'NOT NULL',
+            ];
+        }
+
+        /*
+         * DEFAULT.
+         */
+        if (
+            !defaultsEqualForColumn(
+                $dbColumn['default'],
+                $modelColumn['default'],
+                (bool) $dbColumn['nullable'],
+                (bool) $modelColumn['nullable']
+            )
+        ) {
+            $differences[] = [
+                'type' => 'column_default',
+                'table' => $database['name'],
+                'column' => $columnName,
+                'model' => formatValue(
+                    $modelColumn['default']
+                ),
+                'database' => formatValue(
+                    $dbColumn['default']
+                ),
+            ];
+        }
+    }
+
+    /*
+     * PRIMARY KEY.
+     */
+    $databasePrimary = array_map(
+        'strtolower',
+        $database['primaryKey'] ?? []
+    );
+
+    $modelPrimary = array_map(
+        'strtolower',
+        $model['primaryKey'] ?? []
+    );
+
+    if ($databasePrimary !== $modelPrimary) {
+        $differences[] = [
+            'type' => 'primary_key',
+            'table' => $database['name'],
+            'model' => implode(
+                ', ',
+                $model['primaryKey'] ?? []
+            ),
+            'database' => implode(
+                ', ',
+                $database['primaryKey'] ?? []
+            ),
+        ];
+    }
+
+    return $differences;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| AUXILIARES
+|--------------------------------------------------------------------------
+*/
+
+function findCaseInsensitive(
+    array $array,
+    string $name
+): ?array {
+    foreach ($array as $key => $value) {
+        if (strcasecmp($key, $name) === 0) {
+            return $value;
+        }
+    }
+
+    return null;
+}
+
+
+/**
+ * Obtém um value direto de um objeto.
+ */
+function getDirectValue(
+    DOMXPath $xpath,
+    DOMElement $node,
+    string $key
+): ?string {
+    $valueNode = getDirectValueNode(
+        $xpath,
+        $node,
+        $key
+    );
+
+    if ($valueNode === null) {
+        return null;
+    }
+
+    /*
+     * Se for um value simples, retorna o texto.
+     */
+    return trim($valueNode->textContent);
+}
+
+
+/**
+ * Obtém o nó value diretamente associado à chave.
+ */
+function getDirectValueNode(
+    DOMXPath $xpath,
+    DOMElement $node,
+    string $key
+): ?DOMElement {
+    foreach (
+        $xpath->query(
+            './value[@key="' .
+            htmlspecialchars($key, ENT_QUOTES) .
+            '"]',
+            $node
+        ) as $valueNode
+    ) {
+        return $valueNode;
+    }
+
+    return null;
+}
+
+
+/**
+ * Obtém uma lista de strings de um value.
+ */
+function getDirectValueList(
+    DOMXPath $xpath,
+    DOMElement $node,
+    string $key
+): array {
+    $container = getDirectValueNode(
+        $xpath,
+        $node,
+        $key
+    );
+
+    if ($container === null) {
+        return [];
+    }
+
+    $values = [];
+
+    foreach (
+        $xpath->query(
+            './value[@type="string"]',
+            $container
+        ) as $value
+    ) {
+        $values[] = trim($value->textContent);
+    }
+
+    return $values;
+}
+
+
+/**
+ * Formata valores para o relatório.
+ */
+function formatValue(?string $value): string
 {
-    $out = [];
-    $out[] = str_repeat('=', 72);
-    $out[] = 'COMPARAÇÃO DA MODELAGEM';
-    $out[] = str_repeat('=', 72);
-    $out[] = '';
-
-    $out[] = 'TABELAS';
-    $out[] = str_repeat('-', 72);
-
-    foreach ($r['tables_equal'] as $table) {
-        $out[] = "✓ {$table}";
+    if ($value === null || $value === '') {
+        return '(nenhum)';
     }
 
-    foreach ($r['tables_only_model'] as $table) {
-        $out[] = "✗ {$table} — existe no MODELO, mas não no BANCO";
-    }
+    return $value;
+}
 
-    foreach ($r['tables_only_database'] as $table) {
-        $out[] = "✗ {$table} — existe no BANCO, mas não no MODELO";
-    }
 
-    foreach ($r['tables'] as $table => $diff) {
-        $out[] = "✗ {$table}";
+/*
+|--------------------------------------------------------------------------
+| RELATÓRIO TXT
+|--------------------------------------------------------------------------
+*/
 
-        foreach ($diff['columns_only_model'] as $column) {
-            $out[] = "    + {$column} — existe no MODELO, mas não no BANCO";
+function renderTextReport(array $report): string
+{
+    $lines = [];
+
+    $lines[] = '========================================================================';
+    $lines[] = 'COMPARAÇÃO DA MODELAGEM';
+    $lines[] = '========================================================================';
+    $lines[] = '';
+    $lines[] = 'TABELAS';
+    $lines[] = '------------------------------------------------------------------------';
+
+    foreach ($report['tables'] as $tableName => $table) {
+        if ($table['status'] === 'ok') {
+            $lines[] = "✓ {$tableName}";
+            continue;
         }
 
-        foreach ($diff['columns_only_database'] as $column) {
-            $out[] = "    - {$column} — existe no BANCO, mas não no MODELO";
+        if ($table['status'] === 'missing_database') {
+            $lines[] = "✗ {$tableName}";
+            $lines[] =
+                "    + existe no MODELO, mas não no BANCO";
+            continue;
         }
 
-        foreach ($diff['columns'] as $column => $changes) {
-            foreach ($changes as $property => $values) {
-                $label = match ($property) {
-                    'type' => 'tipo',
-                    'nullable' => 'nulabilidade',
-                    'default' => 'default',
-                    default => $property,
-                };
+        if ($table['status'] === 'missing_model') {
+            $lines[] = "✗ {$tableName}";
+            $lines[] =
+                "    - existe no BANCO, mas não no MODELO";
+            continue;
+        }
 
-                $out[] = "    ✗ {$column}.{$label}";
-                $out[] = "        Modelo : {$values['model']}";
-                $out[] = "        Banco  : {$values['database']}";
+        $lines[] = "✗ {$tableName}";
+
+        foreach ($table['differences'] as $difference) {
+            switch ($difference['type']) {
+                case 'column_model_only':
+                    $lines[] =
+                        "    + {$difference['column']} — " .
+                        "existe no MODELO, mas não no BANCO";
+                    break;
+
+                case 'column_database_only':
+                    $lines[] =
+                        "    - {$difference['column']} — " .
+                        "existe no BANCO, mas não no MODELO";
+                    break;
+
+                case 'column_type':
+                    $lines[] =
+                        "    ✗ {$difference['column']}.tipo";
+
+                    $lines[] =
+                        "        Modelo : " .
+                        $difference['model'];
+
+                    $lines[] =
+                        "        Banco  : " .
+                        $difference['database'];
+                    break;
+
+                case 'column_nullable':
+                    $lines[] =
+                        "    ✗ {$difference['column']}.nulabilidade";
+
+                    $lines[] =
+                        "        Modelo : " .
+                        $difference['model'];
+
+                    $lines[] =
+                        "        Banco  : " .
+                        $difference['database'];
+                    break;
+
+                case 'column_default':
+                    $lines[] =
+                        "    ✗ {$difference['column']}.default";
+
+                    $lines[] =
+                        "        Modelo : " .
+                        $difference['model'];
+
+                    $lines[] =
+                        "        Banco  : " .
+                        $difference['database'];
+                    break;
+
+                case 'primary_key':
+                    $lines[] =
+                        "    ✗ PRIMARY KEY";
+
+                    $lines[] =
+                        "        Modelo : " .
+                        formatValue($difference['model']);
+
+                    $lines[] =
+                        "        Banco  : " .
+                        formatValue($difference['database']);
+                    break;
             }
         }
+    }
 
-        if ($diff['primary_different']) {
-            $out[] = "    ✗ PRIMARY KEY";
-            $out[] = "        Modelo : (" . implode(', ', $diff['primary_model']) . ")";
-            $out[] = "        Banco  : (" . implode(', ', $diff['primary_database']) . ")";
+    /*
+     * Diferenças de tabelas inexistentes.
+     */
+    foreach ($report['differences'] as $difference) {
+        if ($difference['type'] === 'table_added') {
+            $lines[] = "✗ {$difference['table']}";
+            $lines[] =
+                "    + existe no MODELO, mas não no BANCO";
+        }
+
+        if ($difference['type'] === 'table_added_model') {
+            $lines[] = "✗ {$difference['table']}";
+            $lines[] =
+                "    - existe no BANCO, mas não no MODELO";
         }
     }
 
-    $out[] = '';
-    $out[] = str_repeat('=', 72);
-    $out[] = 'RESUMO';
-    $out[] = str_repeat('=', 72);
-    $out[] = 'Diferenças encontradas: ' . $r['differences'];
+    $lines[] = '';
+    $lines[] = '========================================================================';
+    $lines[] = 'RESUMO';
+    $lines[] = '========================================================================';
+    $lines[] =
+        'Diferenças encontradas: ' .
+        count($report['differences']);
 
-    if ($r['differences'] === 0) {
-        $out[] = '✓ Banco e modelo são equivalentes nos itens comparados.';
-    }
-
-    $out[] = '';
-    return implode(PHP_EOL, $out);
-}
-
-function h(string $v): string
-{
-    return htmlspecialchars($v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-}
-
-function fail(string $message): never
-{
-    fwrite(STDERR, "ERRO: {$message}\n");
-    exit(1);
+    return implode(PHP_EOL, $lines);
 }
