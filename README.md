@@ -1,1 +1,1 @@
-Comparador simples de modelagem MySQL Workbench com script DDL
+Simple MySQL Workbench modeling comparator with DDL script
