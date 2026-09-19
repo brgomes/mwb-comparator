@@ -1217,10 +1217,34 @@ function compareTable(
          * Existe apenas no banco.
          */
         if ($modelColumn === null) {
+            $databaseColumnNames = array_keys($databaseColumns);
+            $databasePosition = array_search($columnName, $databaseColumnNames, true);
+
+            if ($databasePosition === false) {
+                foreach ($databaseColumnNames as $position => $databaseColumnName) {
+                    if (strcasecmp($databaseColumnName, $columnName) === 0) {
+                        $databasePosition = $position;
+                        $columnName = $databaseColumnName;
+                        break;
+                    }
+                }
+            }
+
+            $previousColumn = null;
+            if ($databasePosition !== false && $databasePosition > 0) {
+                $previousColumn = $databaseColumnNames[$databasePosition - 1];
+            }
+
+            $databaseOnlyColumn = $dbColumn;
+
             $differences[] = [
                 'type' => 'column_database_only',
                 'table' => $database['name'],
                 'column' => $columnName,
+                'previous' => $previousColumn,
+                'databaseType' => normalizeSqlType($databaseOnlyColumn['type']),
+                'databaseNullable' => $databaseOnlyColumn['nullable'] ? 'NULL' : 'NOT NULL',
+                'databaseDefault' => $databaseOnlyColumn['default'],
             ];
 
             continue;
@@ -1287,6 +1311,64 @@ function compareTable(
                 'database' => formatValue(
                     $dbColumn['default']
                 ),
+            ];
+        }
+    }
+
+    /*
+     * Posição dos campos.
+     *
+     * A comparação considera apenas os campos que existem nos dois lados
+     * e ignora as colunas de auditoria. Assim, a ausência de um campo não
+     * provoca uma cascata de diferenças de posição nos campos seguintes.
+     */
+    $databaseOrderedColumns = array_keys($databaseColumns);
+    $modelOrderedColumns = array_keys($modelColumns);
+
+    $databaseCommonOrder = [];
+    foreach ($databaseOrderedColumns as $column) {
+        if (findCaseInsensitive($modelColumns, $column) !== null) {
+            $databaseCommonOrder[] = strtolower($column);
+        }
+    }
+
+    $modelCommonOrder = [];
+    foreach ($modelOrderedColumns as $column) {
+        if (findCaseInsensitive($databaseColumns, $column) !== null) {
+            $modelCommonOrder[] = strtolower($column);
+        }
+    }
+
+    $modelPositions = [];
+    foreach ($modelCommonOrder as $position => $column) {
+        $modelPositions[$column] = $position + 1;
+    }
+
+    $databasePositions = [];
+    foreach ($databaseCommonOrder as $position => $column) {
+        $databasePositions[$column] = $position + 1;
+    }
+
+    foreach ($databaseCommonOrder as $column) {
+        if (
+            isset($modelPositions[$column], $databasePositions[$column]) &&
+            $modelPositions[$column] !== $databasePositions[$column]
+        ) {
+            $displayName = $column;
+
+            foreach ($databaseOrderedColumns as $databaseColumnName) {
+                if (strcasecmp($databaseColumnName, $column) === 0) {
+                    $displayName = $databaseColumnName;
+                    break;
+                }
+            }
+
+            $differences[] = [
+                'type' => 'column_position',
+                'table' => $database['name'],
+                'column' => $displayName,
+                'modelPosition' => $modelPositions[$column],
+                'databasePosition' => $databasePositions[$column],
             ];
         }
     }
@@ -1488,6 +1570,41 @@ function renderTextReport(array $report): string
                     $lines[] =
                         "    - {$difference['column']} — " .
                         "existe no BANCO, mas não no MODELO";
+
+                    if ($difference['previous'] !== null) {
+                        $lines[] =
+                            "        Depois de : " .
+                            $difference['previous'];
+                    } else {
+                        $lines[] =
+                            "        Depois de : (primeiro campo da tabela)";
+                    }
+
+                    $lines[] =
+                        "        Tipo      : " .
+                        $difference['databaseType'];
+
+                    $lines[] =
+                        "        Nulabilidade: " .
+                        $difference['databaseNullable'];
+
+                    $lines[] =
+                        "        Default    : " .
+                        formatValue($difference['databaseDefault']);
+                    break;
+
+                case 'column_position':
+                    $lines[] =
+                        "    ✗ {$difference['column']}.posição";
+
+                    $lines[] =
+                        "        Modelo : posição {$difference['modelPosition']}";
+
+                    $lines[] =
+                        "        Banco  : posição {$difference['databasePosition']}";
+
+                    $lines[] =
+                        "        Corrigir a posição do campo na modelagem.";
                     break;
 
                 case 'column_type':
@@ -1542,23 +1659,6 @@ function renderTextReport(array $report): string
                         formatValue($difference['database']);
                     break;
             }
-        }
-    }
-
-    /*
-     * Diferenças de tabelas inexistentes.
-     */
-    foreach ($report['differences'] as $difference) {
-        if ($difference['type'] === 'table_added') {
-            $lines[] = "✗ {$difference['table']}";
-            $lines[] =
-                "    + existe no MODELO, mas não no BANCO";
-        }
-
-        if ($difference['type'] === 'table_added_model') {
-            $lines[] = "✗ {$difference['table']}";
-            $lines[] =
-                "    - existe no BANCO, mas não no MODELO";
         }
     }
 
