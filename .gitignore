@@ -1,3 +1,5 @@
 *.sql
 *.mwb
 *.txt
+/config.php
+!tests/fixtures/*.sql

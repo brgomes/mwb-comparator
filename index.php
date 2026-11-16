@@ -1,91 +1,58 @@
 <?php
 
 /**
- * Compara banco.sql x model.mwb
- *
- * Compara:
- *   - tabelas
- *   - colunas
- *   - tipo de dados (incluindo tamanho/precisão/UNSIGNED)
- *   - NULL / NOT NULL
- *   - DEFAULT
- *   - PRIMARY KEY
- *
- * Ignora:
- *   - índices secundários
- *   - nomes de índices
- *   - FOREIGN KEY
- *   - constraints
- *   - colunas de auditoria:
- *       created_at
- *       updated_at
- *       created_by
- *       updated_by
- *
- * Uso:
- *   php index.php nome
- *
- * Os arquivos nome.sql, nome.mwb e nome.txt
- * devem estar na mesma pasta.
+ * Compara a estrutura de um banco MySQL/MariaDB ou PostgreSQL com um .mwb.
+ * Uso: php index.php nome [config.php]
+ * O PHP retorna um array de configurações indexadas pelo nome.
  */
+
+require_once __DIR__ . '/src/config.php';
+require_once __DIR__ . '/src/database.php';
 
 if (PHP_SAPI !== 'cli') {
     exit("Execute este arquivo pela CLI.\n");
 }
 
-if ($argc !== 2) {
-    exit("Uso: php index.php nome\n");
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
+    try {
+        exit(main($argv));
+    } catch (RuntimeException $exception) {
+        fail($exception->getMessage());
+    }
 }
 
-$name = trim($argv[1]);
+function main(array $arguments): int
+{
+    if (count($arguments) < 2 || count($arguments) > 3) {
+        throw new RuntimeException('Uso: php index.php nome [config.php]. Exemplo: php index.php projeto_a');
+    }
 
-if ($name === '' || preg_match('~[\\/:*?"<>|]~', $name)) {
-    exit(
-        "ERRO: informe um nome válido para os arquivos.\n" .
-        "Exemplo: php index.php sobgestao\n"
-    );
+    $configFile = $arguments[2] ?? __DIR__ . '/config.php';
+    $config = loadConfig($configFile, $arguments[1]);
+
+    foreach (['zip', 'dom'] as $extension) {
+        if (!extension_loaded($extension)) {
+            throw new RuntimeException("Instale/habilite a extensão PHP {$extension} para ler o arquivo MWB.");
+        }
+    }
+
+    $model = parseMwb($config['model']);
+    if ($model === []) {
+        throw new RuntimeException('Nenhuma tabela MySQL encontrada no modelo MWB. Verifique o arquivo configurado.');
+    }
+    $database = readDatabaseSchema($config['database']);
+    $output = renderTextReport(compareSchemas($database, $model, $config['ignore_tables']));
+
+    if (@file_put_contents($config['report'], $output . PHP_EOL, LOCK_EX) === false) {
+        throw new RuntimeException('Não foi possível salvar o relatório TXT. Verifique report.path e as permissões de escrita.');
+    }
+
+    echo $output . PHP_EOL . PHP_EOL;
+    echo "Relatório TXT salvo em: {$config['report']}" . PHP_EOL;
+
+    // Diferenças são o resultado da comparação, não um erro de execução.
+    return 0;
 }
-
-$sqlFile = __DIR__ . DIRECTORY_SEPARATOR . $name . '.sql';
-$mwbFile = __DIR__ . DIRECTORY_SEPARATOR . $name . '.mwb';
-
-$reportFile = basename($name . '.txt');
-$reportPath = __DIR__ . DIRECTORY_SEPARATOR . $reportFile;
-
-if (!is_file($sqlFile)) {
-    fail("Arquivo SQL não encontrado: {$name}.sql");
-}
-
-if (!is_file($mwbFile)) {
-    fail("Arquivo MWB não encontrado: {$name}.mwb");
-}
-
-$db = parseSqlDump($sqlFile);
-$model = parseMwb($mwbFile);
-
-$report = compareSchemas($db, $model);
-
-$output = renderTextReport($report);
-
-echo $output . PHP_EOL;
-
-$ok = @file_put_contents(
-    $reportPath,
-    $output . PHP_EOL
-);
-
-if ($ok === false) {
-    fail(
-        "não foi possível criar {$reportFile} " .
-        "(permissão de escrita)."
-    );
-}
-
-echo PHP_EOL;
-echo "Relatório TXT salvo na raiz do projeto: {$reportFile}" . PHP_EOL;
-
-// Diferenças são o resultado da comparação, não um erro de execução.
-exit(0);
 
 
 /*
@@ -98,258 +65,6 @@ function fail(string $message): never
 {
     echo "ERRO: {$message}" . PHP_EOL;
     exit(1);
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| SQL
-|--------------------------------------------------------------------------
-*/
-
-function parseSqlDump(string $file): array
-{
-    $sql = file_get_contents($file);
-
-    if ($sql === false) {
-        fail("não foi possível ler o arquivo SQL.");
-    }
-
-    $tables = [];
-
-    /*
-     * Captura cada CREATE TABLE.
-     */
-    preg_match_all(
-        '/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?([a-zA-Z0-9_]+)[`"]?\s*\((.*?)\)\s*(?:ENGINE|;)/is',
-        $sql,
-        $matches,
-        PREG_SET_ORDER
-    );
-
-    foreach ($matches as $match) {
-        $tableName = $match[1];
-        $body = $match[2];
-
-        $columns = [];
-        $primaryKey = [];
-
-        $lines = splitSqlDefinitions($body);
-
-        foreach ($lines as $line) {
-            $line = trim($line);
-
-            if ($line === '') {
-                continue;
-            }
-
-            /*
-             * PRIMARY KEY
-             */
-            if (preg_match(
-                '/^PRIMARY\s+KEY\s*\((.*?)\)/i',
-                $line,
-                $pkMatch
-            )) {
-                preg_match_all(
-                    '/[`"]?([a-zA-Z0-9_]+)[`"]?/',
-                    $pkMatch[1],
-                    $pkColumns
-                );
-
-                $primaryKey = $pkColumns[1] ?? [];
-
-                continue;
-            }
-
-            /*
-             * Ignora índices secundários.
-             */
-            if (preg_match(
-                '/^(?:UNIQUE\s+)?(?:KEY|INDEX)\s+/i',
-                $line
-            )) {
-                continue;
-            }
-
-            /*
-             * Ignora FOREIGN KEY.
-             */
-            if (preg_match(
-                '/^(?:CONSTRAINT\s+[`"]?[^`"\s]+[`"]?\s+)?FOREIGN\s+KEY/i',
-                $line
-            )) {
-                continue;
-            }
-
-            /*
-             * Ignora constraints.
-             */
-            if (preg_match(
-                '/^(?:CONSTRAINT|CHECK)\s+/i',
-                $line
-            )) {
-                continue;
-            }
-
-            /*
-             * Coluna.
-             */
-            if (!preg_match(
-                '/^[`"]?([a-zA-Z0-9_]+)[`"]?\s+(.+)$/s',
-                $line,
-                $columnMatch
-            )) {
-                continue;
-            }
-
-            $columnName = $columnMatch[1];
-            $definition = trim($columnMatch[2]);
-
-            $column = parseSqlColumnDefinition($definition);
-
-            $columns[$columnName] = $column;
-        }
-
-        $tables[$tableName] = [
-            'name' => $tableName,
-            'columns' => $columns,
-            'primaryKey' => $primaryKey,
-        ];
-    }
-
-    return $tables;
-}
-
-
-/**
- * Divide as definições do CREATE TABLE respeitando parênteses
- * e strings.
- */
-function splitSqlDefinitions(string $body): array
-{
-    $definitions = [];
-    $current = '';
-
-    $depth = 0;
-    $quote = null;
-    $length = strlen($body);
-
-    for ($i = 0; $i < $length; $i++) {
-        $char = $body[$i];
-
-        if ($quote !== null) {
-            $current .= $char;
-
-            if ($char === '\\' && $i + 1 < $length) {
-                $current .= $body[++$i];
-                continue;
-            }
-
-            if ($char === $quote) {
-                $quote = null;
-            }
-
-            continue;
-        }
-
-        if ($char === "'" || $char === '"') {
-            $quote = $char;
-            $current .= $char;
-            continue;
-        }
-
-        if ($char === '(') {
-            $depth++;
-            $current .= $char;
-            continue;
-        }
-
-        if ($char === ')') {
-            $depth--;
-            $current .= $char;
-            continue;
-        }
-
-        if ($char === ',' && $depth === 0) {
-            $definitions[] = trim($current);
-            $current = '';
-            continue;
-        }
-
-        $current .= $char;
-    }
-
-    if (trim($current) !== '') {
-        $definitions[] = trim($current);
-    }
-
-    return $definitions;
-}
-
-
-/**
- * Analisa a definição de uma coluna SQL.
- */
-function parseSqlColumnDefinition(string $definition): array
-{
-    $type = '';
-    $nullable = true;
-    $default = null;
-
-    /*
-     * Tipo:
-     * VARCHAR(191)
-     * DECIMAL(12,2)
-     * ENUM('A','B')
-     * etc.
-     */
-    if (preg_match(
-        '/^([a-zA-Z]+)(\s*\([^)]*\))?(?:\s+UNSIGNED)?/i',
-        $definition,
-        $typeMatch
-    )) {
-        $type = $typeMatch[1];
-
-        if (!empty($typeMatch[2])) {
-            $type .= $typeMatch[2];
-        }
-
-        if (preg_match(
-            '/\bUNSIGNED\b/i',
-            substr($definition, strlen($typeMatch[0]))
-        )) {
-            $type .= ' UNSIGNED';
-        } elseif (preg_match('/\bUNSIGNED\b/i', $definition)) {
-            $type .= ' UNSIGNED';
-        }
-    }
-
-    /*
-     * NOT NULL / NULL
-     */
-    if (preg_match('/\bNOT\s+NULL\b/i', $definition)) {
-        $nullable = false;
-    } elseif (preg_match('/\bNULL\b/i', $definition)) {
-        $nullable = true;
-    }
-
-    /*
-     * DEFAULT.
-     */
-    if (preg_match(
-        '/\bDEFAULT\s+((?:\'(?:\\\\.|[^\'])*\')|(?:"(?:\\\\.|[^"])*")|[^\s,]+)/i',
-        $definition,
-        $defaultMatch
-    )) {
-        $default = $defaultMatch[1];
-    }
-
-    return [
-        'type' => normalizeSqlType($type),
-        'nullable' => $nullable,
-        'default' => normalizeDefault($default),
-    ];
 }
 
 
@@ -979,17 +694,14 @@ function normalizeDefault(?string $v): ?string
         '/^[+-]?(?:\d+\.?\d*|\.\d+)$/',
         $v
     )) {
-        $normalized = rtrim(
-            rtrim($v, '0'),
-            '.'
-        );
-
-        if (
-            $normalized === '' ||
-            $normalized === '-0' ||
-            $normalized === '+0'
-        ) {
-            return '0';
+        $negative = str_starts_with($v, '-');
+        $parts = explode('.', ltrim($v, '+-'), 2);
+        $integer = ltrim($parts[0], '0');
+        $integer = $integer === '' ? '0' : $integer;
+        $fraction = rtrim($parts[1] ?? '', '0');
+        $normalized = $integer . ($fraction === '' ? '' : '.' . $fraction);
+        if ($negative && $normalized !== '0') {
+            $normalized = '-' . $normalized;
         }
 
         return $normalized;
@@ -1072,9 +784,11 @@ function isIgnoredColumn(string $column): bool
 
 function compareSchemas(
     array $database,
-    array $model
+    array $model,
+    array $ignoredTables = []
 ): array {
     $differences = [];
+    $ignoredTables = array_fill_keys(array_map('strtolower', $ignoredTables), true);
 
     /*
      * Tabelas.
@@ -1091,6 +805,10 @@ function compareSchemas(
     $tables = [];
 
     foreach ($allTables as $table) {
+        if (isset($ignoredTables[strtolower($table)])) {
+            continue;
+        }
+
         $dbTable = findCaseInsensitive(
             $database,
             $table
