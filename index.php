@@ -379,7 +379,10 @@ function buildMwbType(
             'com.mysql.rdbms.mysql.userdatatype.boolean'
         )
     ) {
-        return 'TINYINT(1)';
+        $simpleType = 'com.mysql.rdbms.mysql.datatype.tinyint';
+        $precision = '1';
+        $length = null;
+        $scale = null;
     }
 
     if (
@@ -389,7 +392,7 @@ function buildMwbType(
             'com.mysql.rdbms.mysql.userdatatype.integer'
         )
     ) {
-        return 'INT';
+        $simpleType = 'com.mysql.rdbms.mysql.datatype.int';
     }
 
     /*
@@ -409,6 +412,7 @@ function buildMwbType(
         'SMALLINT' => 'SMALLINT',
         'MEDIUMINT' => 'MEDIUMINT',
         'TINYINT' => 'TINYINT',
+        'BIT' => 'BIT',
         'DECIMAL' => 'DECIMAL',
         'NUMERIC' => 'DECIMAL',
         'FLOAT' => 'FLOAT',
@@ -442,58 +446,35 @@ function buildMwbType(
         $type = $map[$type];
     }
 
-    /*
-     * ENUM / SET.
-     */
-    if (
-        in_array($type, ['ENUM', 'SET'], true) &&
-        $explicitParams !== null &&
-        trim($explicitParams) !== ''
-    ) {
-        $params = normalizeMwbExplicitParams(
-            $explicitParams,
-            $type
-        );
+    $length = normalizeMwbNumericParameter($length);
+    $precision = normalizeMwbNumericParameter($precision);
+    $scale = normalizeMwbNumericParameter($scale);
+    $params = null;
 
+    if (in_array($type, ['ENUM', 'SET'], true)) {
+        if ($explicitParams !== null && trim($explicitParams) !== '') {
+            $params = normalizeMwbExplicitParams($explicitParams, $type);
+        }
+    } elseif (in_array($type, ['DECIMAL', 'FLOAT', 'DOUBLE'], true)) {
+        $params = $precision ?? $length;
+        if ($params !== null && $scale !== null) {
+            $params .= ',' . $scale;
+        }
+    } elseif (in_array($type, ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT', 'BIT'], true)) {
+        // O Workbench armazena a largura dos inteiros no atributo precision.
+        $params = $precision ?? $length;
+    } elseif (in_array($type, ['CHAR', 'VARCHAR', 'BINARY', 'VARBINARY', 'TEXT', 'BLOB', 'TIME', 'DATETIME', 'TIMESTAMP', 'YEAR'], true)) {
+        // Precisão temporal pode aparecer como length ou precision no MWB.
+        $params = $length ?? $precision;
+    }
+
+    // Alguns arquivos guardam os parâmetros apenas em datatypeExplicitParams.
+    if ($params === null && $explicitParams !== null
+        && preg_match('/^\(?\s*(\d+(?:\s*,\s*\d+)?)\s*\)?$/', trim($explicitParams), $match)) {
+        $params = preg_replace('/\s+/', '', $match[1]);
+    }
+    if ($params !== null) {
         $type .= '(' . $params . ')';
-    }
-
-    /*
-     * VARCHAR / CHAR / BINARY / VARBINARY.
-     */
-    elseif (
-        in_array(
-            $type,
-            ['VARCHAR', 'CHAR', 'BINARY', 'VARBINARY'],
-            true
-        )
-    ) {
-        if ($length !== null && trim($length) !== '') {
-            $type .= '(' . trim($length) . ')';
-        }
-    }
-
-    /*
-     * DECIMAL.
-     */
-    elseif (
-        in_array($type, ['DECIMAL', 'NUMERIC'], true)
-    ) {
-        if (
-            $precision !== null &&
-            trim($precision) !== ''
-        ) {
-            $type .= '(' . trim($precision);
-
-            if (
-                $scale !== null &&
-                trim($scale) !== ''
-            ) {
-                $type .= ',' . trim($scale);
-            }
-
-            $type .= ')';
-        }
     }
 
     /*
@@ -507,6 +488,19 @@ function buildMwbType(
     }
 
     return $type;
+}
+
+
+/** -1, vazio e null representam parâmetros não definidos no Workbench. */
+function normalizeMwbNumericParameter(?string $value): ?string
+{
+    if ($value === null || !ctype_digit(trim($value))) {
+        return null;
+    }
+
+    $value = ltrim(trim($value), '0');
+
+    return $value === '' ? '0' : $value;
 }
 
 
@@ -602,19 +596,6 @@ function normalizeSqlType(string $type): string
         'DOUBLE',
         $type
     ) ?? $type;
-
-    /*
-     * O MySQL/MariaDB aceita display width em inteiros,
-     * como INT(11) e BIGINT(20). Isso não representa
-     * diferença real de capacidade do tipo.
-     */
-    if (preg_match(
-        '/^(TINYINT|SMALLINT|MEDIUMINT|INT|BIGINT)(?:\([^)]*\))?(\s+UNSIGNED)?$/',
-        $type,
-        $m
-    )) {
-        $type = $m[1] . ($m[2] ?? '');
-    }
 
     /*
      * ENUM / SET.

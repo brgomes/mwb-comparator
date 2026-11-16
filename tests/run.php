@@ -1,10 +1,12 @@
 <?php
 
 require __DIR__ . '/helpers.php';
+require __DIR__ . '/types.php';
 
 $directory = sys_get_temp_dir() . '/mwb-comparator-' . bin2hex(random_bytes(6));
 mkdir($directory);
 try {
+    checkTypeParameters($directory);
     writeTestModel($directory . '/model.mwb');
     $entry = [
         'database' => [
